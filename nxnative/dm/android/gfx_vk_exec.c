@@ -451,7 +451,20 @@ void vk_crumbs_report(void) {
         shown++; VKLOG("[crumbs] then submission %u pass %d:", c->sub, c->pass);
         for (int k = 0; k < c->n; k++) VKLOG("[crumbs]   shaders %016llx %016llx %016llx", (unsigned long long)c->k[k][0], (unsigned long long)c->k[k][1], (unsigned long long)c->k[k][2]); }
 }
+// DM_VK_PASS_ENDS=1 (start-up, diagnosis): every 600 presents, the places that end passes with draws in them, by count a frame (offsets in this library)
+static void pass_end_count(void *ra) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_PASS_ENDS"); on = e && atoi(e); } if (!on) return;
+    enum { PE = 32 }; static struct { uintptr_t ra; uint32_t n, draws; } t[PE]; static uint64_t last_frame; static uintptr_t base;
+    if (!base) { Dl_info di; base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 1; }
+    uintptr_t a = (uintptr_t)ra - base; int i = 0; while (i < PE && t[i].ra && t[i].ra != a) i++;
+    if (i < PE) { t[i].ra = a; t[i].n++; t[i].draws += (uint32_t)g_pass_draws; }
+    extern uint64_t g_tex_frame; if (!last_frame) last_frame = g_tex_frame;
+    if (g_tex_frame - last_frame >= 600) { double f = (double)(g_tex_frame - last_frame); char l[1024]; size_t o = 0;
+        for (int k = 0; k < PE && t[k].ra && o < sizeof l - 64; k++) o += snprintf(l + o, sizeof l - o, " %#lx:%.1f(%.0f draws)", (unsigned long)t[k].ra, t[k].n / f, t[k].n ? (double)t[k].draws / t[k].n : 0);
+        VKLOG("pass ends a frame:%s", l); memset(t, 0, sizeof t); last_frame = g_tex_frame; }
+}
 void vk_end_pass(void) {
+    if (S.pass_open == 1) pass_end_count(__builtin_return_address(0));
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
     if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
@@ -505,16 +518,16 @@ static int begin_pass(void) {
     // 6-23 of 600 recorded frames; 0 with DM_VK_CB_DRAWS=0, also 2-15 with the parts submitted together, 135 without the LRZ touches). Such a pass first gets a texel of its
     // depth written back (lrz_touch), the transfer write that made Adreno drop a stale LRZ for Xenoblade Chronicles 3 (DM_VK_LRZ_TOUCH=0 leaves it out)
     static uint64_t g_cuts; int cut_touch = 0;
-    vkimg_t *dim = NULL; if (da.imageView) vk_tex_view(&S.rt_dep, S.rt_has_dview ? &S.rt_dview : NULL, 0xff, 0, 1, &dim);
+    vkimg_t *dim = da.imageView ? P_att[8].im : NULL;   // (the image the depth lookup above found; P_att[8].im is set exactly when da.imageView is)
     if (psplit || (g_x_cbdraws > 0 && g_cb_draws >= g_x_cbdraws && (!dim || dim->depth_sub != g_set_epoch || g_x_cutany))) {   // (a pass split: prepare_draw checked the depth rule and the part budget)
         void vk_cmd_split(void); if (g_x_landcut) vk_ubd_land(vk_cmd());
         if (psplit) vk_cmd_split(); else if (g_ord_parts < 15) { vk_cmd_split(); g_ord_parts++; }   // ordinary cuts as before MAIN_CBS 32 (refused past 15; g_cuts still counts, as it did)
         g_cb_draws = 0; cb = vk_cmd(); g_cuts++;   // no pass is open here; deferred uniform updates stay deferred (draws read their shadows)
     }
     if (dim) { cut_touch = g_lrz_touch && dim->depth_sub == g_set_epoch && dim->depth_cut != g_cuts; dim->depth_sub = g_set_epoch; dim->depth_cut = g_cuts; }
-    { static int n; uint32_t cs[9] = {0}; int any = 0, mis = 0; uint32_t s0 = 0;   // multisampled passes: every attachment's sample count (they must agree)
-      for (int i = 0; i < ncol; i++) if (ca[i].imageView) { vkimg_t *im2; vk_tex_view(&S.rt_col[i], S.rt_has_cview[i] ? &S.rt_cview[i] : NULL, 0xff, 0, 1, &im2); cs[i] = im2 ? im2->samples : 0; if (cs[i] > 1) any = 1; if (!s0) s0 = cs[i]; else if (cs[i] != s0) mis = 1; }
-      if (da.imageView) { vkimg_t *im2; vk_tex_view(&S.rt_dep, S.rt_has_dview ? &S.rt_dview : NULL, 0xff, 0, 1, &im2); cs[8] = im2 ? im2->samples : 0; if (cs[8] > 1) any = 1; if (s0 && cs[8] != s0) mis = 1; }
+    { static int n; uint32_t cs[9] = {0}; int any = 0, mis = 0; uint32_t s0 = 0;   // multisampled passes: every attachment's sample count (they must agree; P_att: the images found above)
+      for (int i = 0; i < ncol; i++) if (P_att[i].im) { cs[i] = P_att[i].im->samples; if (cs[i] > 1) any = 1; if (!s0) s0 = cs[i]; else if (cs[i] != s0) mis = 1; }
+      if (P_att[8].im) { cs[8] = P_att[8].im->samples; if (cs[8] > 1) any = 1; if (s0 && cs[8] != s0) mis = 1; }
       if ((any || mis) && n < 10) { n++; VKLOG("pass %ux%u samples: colour %u %u %u %u, depth %u%s", w, h, cs[0], cs[1], cs[2], cs[3], cs[8], mis ? " MISMATCH" : ""); } }
     if (!g_x_nobar) vk_img_barrier_all(cb);
     if (cut_touch) lrz_touch(dim, 1);   // (after the barrier: the earlier command buffer's depth writes come first)
