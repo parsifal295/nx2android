@@ -12,8 +12,9 @@ setting	docked=0
 env	DM_NVN_ASYNC=1
 # colour render targets keep Adreno's UBWC compression: the opening's GPU time 35-40% lower (14 to 8-9 ms at about 550 draws)
 env	DM_VK_UBWC=1
-# back up to 60 fps judged on the median frame: at 40 its p90 stayed at 21-25 ms though it held 60 with 1-2 of 64 frames late
-env	DM_ADAPT_UP_PCT=50
+# the game's 60 fps, no adaptive step: at 40 the clocks drop and combat measured 17-18 ms of work (GPU busy 17 ms), so the rate never stepped back up; held at
+# 60 the same combat took 13.6 ms of GPU with 3-6% of frames shown at 25 ms, the battle map 1% and the opening 7%
+env	DM_ADAPTIVE_FPS=0
 # the battle map draws ~2,030 of its ~3,500 draws in one pass without depth (13 ms of GPU): split every 512 draws, the GPU starts on it while the replay records the rest
 env	DM_VK_PASS_SPLIT=512
 # the replay thread on the prime core: the battle map's replay 12.5 to 10.0 ms a frame (all big cores: no change)
