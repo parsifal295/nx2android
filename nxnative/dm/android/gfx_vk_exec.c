@@ -628,15 +628,22 @@ static void bind_program(const p_bind_program *bp) {
     uint32_t mask = bp->stages ? (uint32_t)bp->stages & 0x3f : 0x3f;
     for (int st = 0; st < 6; st++) if (mask >> st & 1) S.sh[st] = NULL;
     S.prog = bp->prog;
-    if (S.prog) for (unsigned i = 0; i < 6; i++) {
-        uint8_t k[8]; if (!prog_key(S.prog, i, k)) break;
-        uint64_t kk = key64(k); int st = kk ? vk_shader_stage(kk) : -1;
-        if (kk && st < 0) {   // the draw or dispatch is skipped. Logged once per shader (the first 16 binds were 4 shaders of Xenoblade Chronicles 3 over and over, which hid others)
-            static uint64_t seen[256]; static int nseen; int known = 0; for (int j = 0; j < nseen; j++) if (seen[j] == kk) { known = 1; break; }
-            if (!known && nseen < 256) { seen[nseen++] = kk; void vk_shader_missing(uint64_t key); vk_shader_missing(kk); shader_dump(S.prog, i, kk); } }
-        if (st < 0 || st > 5 || !(mask >> st & 1)) continue;
-        S.sh[st] = vk_shader(kk, st);
-    }
+    // a program's shaders by stage, kept by its address and serial (SetShaders gives a new one): prog_key's side table (a lock and a dictionary lookup per stage) and
+    // vk_shader's lock took ~5% of the replay in Unicorn Overlord's battles, where most binds repeat a program. Shaders are never freed
+    enum { PCC = 256 }; static struct { const prog_t *p; uint64_t serial; vkshader_t *sh[6]; } pcc[PCC];
+    if (S.prog) { typeof(pcc[0]) *c = &pcc[((uintptr_t)S.prog >> 4) % PCC];
+        if (c->p == S.prog && c->serial == S.prog->serial) { for (int st = 0; st < 6; st++) if (mask >> st & 1 && c->sh[st]) S.sh[st] = c->sh[st]; }
+        else { c->p = NULL; memset(c->sh, 0, sizeof c->sh);
+            for (unsigned i = 0; i < 6; i++) {
+                uint8_t k[8]; if (!prog_key(S.prog, i, k)) break;
+                uint64_t kk = key64(k); int st = kk ? vk_shader_stage(kk) : -1;
+                if (kk && st < 0) {   // the draw or dispatch is skipped. Logged once per shader (the first 16 binds were 4 shaders of Xenoblade Chronicles 3 over and over, which hid others)
+                    static uint64_t seen[256]; static int nseen; int known = 0; for (int j = 0; j < nseen; j++) if (seen[j] == kk) { known = 1; break; }
+                    if (!known && nseen < 256) { seen[nseen++] = kk; void vk_shader_missing(uint64_t key); vk_shader_missing(kk); shader_dump(S.prog, i, kk); } }
+                if (st < 0 || st > 5) continue;
+                c->sh[st] = vk_shader(kk, st); if (mask >> st & 1) S.sh[st] = c->sh[st];
+            }
+            c->p = S.prog; c->serial = S.prog->serial; } }
     S.prog_ok = (S.sh[0] && (S.sh[1] || S.rast_discard)) || S.sh[5];
 }
 typedef struct {
